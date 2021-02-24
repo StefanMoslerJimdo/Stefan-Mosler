@@ -1,0 +1,159 @@
+select
+    c.user_account_id
+        , c.first_assigned_at
+        , case when c.test_search = 1 then 'test'
+               when c.control_search = 1 then 'control' end as test_group
+        , c.country
+        , c.user_age
+        , c.device_type
+        , c.has_website
+        , c.has_domain
+        , c.purpose
+        , c.upgrade_page_action
+        , case when upgrade_page_action in ('recommendation primary', 'recommendation secondary', 'back', 'skip', 'drop', 'free domain', 'transfer') then 'not seen'
+               when (c.test_search = 1 or c.control_search = 1) and upgrade_page_action = 'search' then domain_search_action
+               else 'not seen' end as domain_search_action
+        , case when upgrade_page_action in ('recommendation primary', 'recommendation secondary', 'back', 'skip', 'drop', 'free domain', 'transfer') then 0 else clicked_show_more end as clicked_show_more
+        , case when sum(ir.cm1)>0 then sum(ir.cm1) else 0 end as bookings
+        , max(case when ir.purchase_item_product_type='MAIN' then purchase_item_product_name end) as product_name
+from
+    (
+        select
+            distinct b.user_account_id
+                , b.first_assigned_at
+                , b.test_upgrade
+                , b.control_upgrade
+                , b.test_search
+                , b.control_search
+                , b.country
+                , b.user_age
+                , b.device_type
+                , b.has_website
+                , b.purpose
+                , b.website_id
+                , b.has_domain
+                , max(case when cle.user_account_id is not null then 1 else 0 end)                                                                                            as clicked_show_more
+                , first_value(upgrade_page_action)  over (partition by b.user_account_id order by upgrade_action_at rows between unbounded preceding and unbounded following) as upgrade_page_action
+                , first_value(upgrade_action_at)    over (partition by b.user_account_id order by upgrade_action_at rows between unbounded preceding and unbounded following) as upgrade_action_at
+                , first_value(domain_search_action) over (partition by b.user_account_id order by domain_search_at rows between unbounded preceding and unbounded following)  as domain_search_action
+                , first_value(domain_search_at)     over (partition by b.user_account_id order by domain_search_at rows between unbounded preceding and unbounded following)  as domain_search_action_at
+        from
+            (
+                select
+                    distinct a.user_account_id
+                        , first_assigned_at
+                        , max(a.test_upgrade)       as test_upgrade
+                        , max(a.control_upgrade)    as control_upgrade
+                        , max(a.test_search)        as test_search
+                        , max(a.control_search)     as control_search
+                        , ua.country
+                        , case when ua.created_at::date=first_assigned_at::date then 'new' else 'old' end as user_age
+                        , device_type
+                        , case when cled.topic = 'dolphin_cms.wizard.step.upgrade.set' and json_extract_path_text(cled.message, 'upgradeOptionType') = 'primary'        then 'recommendation primary'
+                               when cled.topic = 'dolphin_cms.wizard.step.upgrade.set' and json_extract_path_text(cled.message, 'upgradeOptionType') = 'secondary'      then 'recommendation secondary'
+                               when cled.topic = 'dolphin_cms.wizard.step.upgrade.set' and json_extract_path_text(cled.message, 'upgradeOptionType') = 'tertiary'      then 'recommendation tertiary'
+                               when cled.topic = 'dolphin_cms.wizard.step.upgrade.set' and json_extract_path_text(cled.message, 'upgradeOptionType') = 'search'         then 'search'
+                               when cled.topic = 'dolphin_cms.wizard.step.upgrade.set' and json_extract_path_text(cled.message, 'upgradeOptionType') = 'transfer'       then 'transfer'
+                               when (control_search = 1) and (cled.topic = 'dolphin_cms.wizard.upgrade.skip_on_continue.set'
+                                                       or cled.topic = 'dolphin_cms.wizard.upgrade.skip_on_contonue.set')                                               then 'free domain'
+                               when (control_search = 1) and cled.topic = 'dolphin_cms.wizard.step.upgrade.skip'                                                       then 'skip'                           
+                               when (test_search = 1) and (cled.topic = 'dolphin_cms.wizard.upgrade.skip_on_continue.set'
+                                                       or cled.topic = 'dolphin_cms.wizard.upgrade.skip_on_contonue.set')                                               then 'free domain'
+                               when (test_search = 1) and cled.topic = 'dolphin_cms.wizard.step.upgrade.skip'                                                      then 'skip'
+                               
+                               when cled.topic = 'dolphin_cms.wizard.back_button.click' and json_extract_path_text(cled.message, 'currentStep') = 'Upgrade'             then 'back'
+                               else 'drop' end as upgrade_page_action
+                        , cled.request_timestamp as upgrade_action_at
+                        , case when (dom.topic = 'dolphin_cms.upgrade.domain_selection_step.select' and json_extract_path_text(dom.message, 'selectedDomain') != '')     then 'select domain'
+                               when dom.topic = 'dolphin_cms.upgrade.domain_selection_step.select' and json_extract_path_text(dom.message, 'selectedDomain') = ''           then 'upgrade'
+                               when (control_search = 1) and dom.topic = 'dolphin_cms.upgrade.domain_transfer_selection_step.select'
+                                   and json_extract_path_text(dom.message, 'selectedDomain') != ''                                                                     then 'transfer'
+                               when (test_search = 1) and dom.topic = 'dolphin_cms.upgrade.domain_selection_step.header_cta.select'                                         then 'transfer'
+                               when (control_search = 1) and dom.topic = 'dolphin_cms.upgrade.upgrade.leave'
+                                   and json_extract_path_text(dom.message, 'url') = '/wizard/cancel-upgrade/?cancellationStep=DomainSelection'                         then 'close'
+                               else 'drop'  end as domain_search_action
+                        , dom.request_timestamp as domain_search_at
+                        , max (case when web.website_id is not null then 1 else 0 end) as has_website
+                        , max (web.purpose) as purpose
+                        , max (web.website_id) as website_id
+                        , max(case when domains.website_id is not null then 1 else 0 end) as has_domain
+                from
+                    (
+                        select
+                            user_account_id
+                                , min(request_timestamp) as first_assigned_at
+                                , max(case when split_part(message,'variation',2) like '%test%' AND split_part(message,'variation',2) not like '%testWith%' then 1 else 0 end) as test_upgrade
+                                , max (case when split_part(message,'group',2) like '%test%' AND split_part(message,'group',2) not like '%testWith%'  then 1 else 0 end) as test_search
+                                , max (case when split_part(message,'variation',2) like '%control%'  then 1 else 0 end) as control_upgrade
+                                , max (case when split_part(message,'group',2) like '%control%'  then 1 else 0 end) as control_search
+                                , max(case when tcled.user_agent like '%Windows%' or tcled.user_agent like '%Macintosh%' or tcled.user_agent like '%X11%'   then 'desktop'
+                                           when tcled.user_agent like '%Android%' or tcled.user_agent like '%iPad%' or tcled.user_agent like '%iPhone%'         then 'mobile'
+                                           when tcled.user_agent is null or user_agent = '{"message":""}'  then null
+                                           else 'other' end) as device_type
+                        from    tracking.combined_log_event_dolphin as tcled
+                        where
+                            request_timestamp between '2021-02-08 14:00:00.000000' and (date(getdate())-interval '1 second')
+                                and topic IN ('dolphin_cms.wizard.dolphin_domains_new_recommendation.test')--,'dolphin_cms.wizard.dolphin_domains_upgrade.test')
+                            --and user_account_id in ('98de6d67-bcb7-473f-a224-2633677eb355')
+
+                        group by 1
+                    ) as a
+                        left join user_account.user_account as ua
+                    on ua.subject=a.user_account_id
+                        left join dolphin.website_user_mapping as map
+                    on a.user_account_id=map.user_account_id
+                        left join dolphin.website as web
+                    on web.website_id=map.website_id
+                        and web.first_created_at>=a.first_assigned_at
+                        left join dolphin.website_domains domains
+                    on web.website_id = domains.website_id
+                        and domain_name not like '%jimdosite.com'
+                        and domain_name not like '%.deleted'
+                        and state = 'registration-complete'
+                        and domains.created_at >= a.first_assigned_at
+                        left join tracking.combined_log_event_dolphin cled
+                    on cled.user_account_id = a.user_account_id
+                        and request_timestamp::Date = first_assigned_at::date
+                        and request_timestamp + interval '5 second' >= first_assigned_at
+                        and (topic in ('dolphin_cms.wizard.step.upgrade.set',
+                                       'dolphin_cms.wizard.upgrade.skip_on_continue.set',
+                                       'dolphin_cms.wizard.upgrade.skip_on_contonue.set',
+                                       'dolphin_cms.wizard.step.upgrade.skip')
+                            or (topic = 'dolphin_cms.wizard.back_button.click'
+                                and json_extract_path_text(cled.message, 'currentStep') = 'Upgrade'))
+                        --or cled.location = 'https://cms.jimdo.com/wizard/upgrade/')
+                        left join tracking.combined_log_event_dolphin dom
+                    on dom.user_account_id = a.user_account_id
+                        and (dom.topic in (
+                                           'dolphin_cms.dolphin_cms.upgrade.domain_selection_step.select',
+                                           'dolphin_cms.upgrade.domain_selection_step.select',
+                                           'dolphin_cms.upgrade.domain_transfer_selection_step.select',
+                                           'dolphin_cms.upgrade.upgrade.leave',
+                                           'dolphin_cms.upgrade.domain_selection_step.header_cta.select'
+                            )
+                            and dom.request_timestamp  + interval '120 second' >= cled.request_timestamp
+                            and dom.request_timestamp::date = first_assigned_at::date)
+                    where (test_upgrade = 0 and test_search = 1 and control_upgrade = 0 and control_search = 0) or
+                    (test_upgrade = 1 and test_search = 1 and control_upgrade = 0 and control_search = 0) or
+                    (test_upgrade = 0 and test_search = 0 and control_upgrade = 0 and control_search = 1) or
+                    (test_upgrade = 0 and test_search = 0 and control_upgrade = 1 and control_search = 1)
+                group by 1,2,7,8,9,10,11,12,13
+            ) b
+                left join tracking.combined_log_event_dolphin cle
+            on b.user_account_id = cle.user_account_id
+                and cle.topic = 'dolphin_cms.upgrade.domain_selection_step.show_more.select'
+                and cle.request_timestamp >= upgrade_action_at
+        where upgrade_action_at is null or upgrade_action_at >= first_assigned_at
+        group by 1,2,3,4,5,6,7,8,9,10,11,12,13, upgrade_page_action, upgrade_action_at, domain_search_action, domain_search_at
+
+    ) c
+        left join mart_kpi.invoice_reporting as ir
+    on ir.website_id = c.website_id
+        and website_type='DOLPHIN'
+        and process_type='NEW' and payment_rate > 0
+        and purchase_created_at >= first_assigned_at
+        and (purchase_created_at >= upgrade_action_at or upgrade_action_at is null)
+where (test_search = 1 or control_search = 1)
+        and user_account_id is not null
+group by 1,2,4,5,6,7,8,9,10,11,12
+, test_search, control_search
